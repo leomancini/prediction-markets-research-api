@@ -1,0 +1,9 @@
+{
+  "service_id": "prediction-markets-research-api",
+  "service_name": "Prediction Markets Research API",
+  "domain": "https://prediction-markets-research-api.noshado.ws",
+  "host": "localhost",
+  "port": "3111",
+  "author": "leo",
+  "created_on": "Wed 27 Aug 2025 12:27:37 AM EDT"
+}
