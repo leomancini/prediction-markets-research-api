@@ -106,6 +106,22 @@ function containsCryptoTerms(title) {
   return CRYPTO_TERMS.some((term) => lowercaseTitle.includes(term));
 }
 
+// Function to clean special and accented characters from titles
+function cleanTitle(title) {
+  // First, normalize accented characters to their base forms
+  const normalized = title
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, ""); // Remove diacritical marks
+  
+  // Keep only alphanumeric characters, spaces, and dashes
+  const cleaned = normalized
+    .replace(/[^a-zA-Z0-9\s\-]/g, " ") // Replace non-allowed chars with spaces
+    .replace(/\s+/g, " ") // Replace multiple spaces with single space
+    .trim(); // Remove leading/trailing spaces
+  
+  return cleaned;
+}
+
 // Function to scrape Polymarket markets
 async function scrapePolymarketMarkets() {
   try {
@@ -127,10 +143,10 @@ async function scrapePolymarketMarkets() {
 
       // Extract market title
       const titleElement = $card.find("p.text-sm.font-semibold").first();
-      let title = titleElement.text().trim();
+      let title = cleanTitle(titleElement.text().trim());
 
       // Clean up title format - remove " by...?" for multi-option markets
-      const cleanTitle = title.replace(/ by\.\.\.\?$/g, "");
+      const cleanedTitle = title.replace(/ by\.\.\.\?$/g, "");
 
       // Extract market link
       const linkElement = $card.find('a[href^="/event/"]').first();
@@ -185,13 +201,13 @@ async function scrapePolymarketMarkets() {
             .find("p.font-semibold.text-text-primary.mr-1")
             .first();
 
-          const name = nameEl.text().trim();
+          const name = cleanTitle(nameEl.text().trim());
           const probability = probabilityEl.text().trim();
 
           if (name && probability && title && volume) {
             // Use "by" format only if original title contained " by...?"
             const fullTitle = title.includes(" by...?")
-              ? `${cleanTitle} by ${name}`
+              ? `${cleanedTitle} by ${name}`
               : `${title} - ${name}`;
 
             // Only add if we haven't seen this title before
