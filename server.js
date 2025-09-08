@@ -10,6 +10,102 @@ const CACHE_DURATION = 60 * 60 * 1000; // 1 hour in milliseconds
 let cachedMarkets = null;
 let cacheTimestamp = null;
 
+// Cryptocurrency terms to filter out
+const CRYPTO_TERMS = [
+  "bitcoin",
+  "btc",
+  "ethereum",
+  "eth",
+  "solana",
+  "sol",
+  "dogecoin",
+  "doge",
+  "cardano",
+  "ada",
+  "polkadot",
+  "dot",
+  "binance",
+  "bnb",
+  "chainlink",
+  "link",
+  "litecoin",
+  "ltc",
+  "polygon",
+  "matic",
+  "avalanche",
+  "avax",
+  "shiba",
+  "shib",
+  "uniswap",
+  "uni",
+  "cosmos",
+  "atom",
+  "algorand",
+  "algo",
+  "tron",
+  "trx",
+  "stellar",
+  "xlm",
+  "monero",
+  "xmr",
+  "eos",
+  "tezos",
+  "xtz",
+  "dash",
+  "zcash",
+  "iota",
+  "miota",
+  "neo",
+  "maker",
+  "mkr",
+  "compound",
+  "comp",
+  "aave",
+  "sushi",
+  "yearn",
+  "yfi",
+  "pancakeswap",
+  "cake",
+  "ftx",
+  "ftt",
+  "celsius",
+  "cel",
+  "crypto",
+  "cryptocurrency",
+  "altcoin",
+  "defi",
+  "nft",
+  "blockchain",
+  "token",
+  "coin",
+  "satoshi",
+  "hodl",
+  "mining",
+  "hash",
+  "wallet",
+  "exchange",
+  "coinbase",
+  "kraken",
+  "gemini",
+  "bybit",
+  "kucoin",
+  "huobi",
+  "okx",
+  "metamask",
+  "ledger",
+  "trezor",
+  "web3",
+  "dao",
+  "smart contract",
+  "dapp"
+];
+
+// Function to check if a market title contains cryptocurrency terms
+function containsCryptoTerms(title) {
+  const lowercaseTitle = title.toLowerCase();
+  return CRYPTO_TERMS.some((term) => lowercaseTitle.includes(term));
+}
+
 // Function to scrape Polymarket markets
 async function scrapePolymarketMarkets() {
   try {
@@ -193,11 +289,13 @@ app.get("/all", async (req, res) => {
   try {
     const markets = await getCachedMarkets();
     // Filter out markets where probability is null, undefined, or NaN
+    // Also filter out cryptocurrency-related markets
     const validMarkets = markets.filter(
       (market) =>
         market.probability !== null &&
         market.probability !== undefined &&
-        !isNaN(market.probability)
+        !isNaN(market.probability) &&
+        !containsCryptoTerms(market.title)
     );
     res.json(validMarkets);
   } catch (error) {
@@ -212,11 +310,13 @@ app.get("/random", async (req, res) => {
   try {
     const markets = await getCachedMarkets();
     // Filter out markets where probability is null, undefined, or NaN
+    // Also filter out cryptocurrency-related markets
     const validMarkets = markets.filter(
       (market) =>
         market.probability !== null &&
         market.probability !== undefined &&
-        !isNaN(market.probability)
+        !isNaN(market.probability) &&
+        !containsCryptoTerms(market.title)
     );
 
     if (validMarkets.length === 0) {
