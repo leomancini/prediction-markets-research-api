@@ -10,8 +10,8 @@ const CACHE_DURATION = 60 * 60 * 1000; // 1 hour in milliseconds
 let cachedMarkets = null;
 let cacheTimestamp = null;
 
-// Cryptocurrency terms to filter out
-const CRYPTO_TERMS = [
+// Terms to filter out from market results
+const FILTER_TERMS = [
   "bitcoin",
   "btc",
   "ethereum",
@@ -97,28 +97,27 @@ const CRYPTO_TERMS = [
   "web3",
   "dao",
   "smart contract",
-  "dapp"
+  "dapp",
+  "elon musk"
 ];
 
-// Function to check if a market title contains cryptocurrency terms
-function containsCryptoTerms(title) {
+// Function to check if a market title contains filtered terms
+function containsFilteredTerms(title) {
   const lowercaseTitle = title.toLowerCase();
-  return CRYPTO_TERMS.some((term) => lowercaseTitle.includes(term));
+  return FILTER_TERMS.some((term) => lowercaseTitle.includes(term));
 }
 
 // Function to clean special and accented characters from titles
 function cleanTitle(title) {
   // First, normalize accented characters to their base forms
-  const normalized = title
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, ""); // Remove diacritical marks
-  
+  const normalized = title.normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // Remove diacritical marks
+
   // Keep only alphanumeric characters, spaces, and dashes
   const cleaned = normalized
     .replace(/[^a-zA-Z0-9\s\-]/g, " ") // Replace non-allowed chars with spaces
     .replace(/\s+/g, " ") // Replace multiple spaces with single space
     .trim(); // Remove leading/trailing spaces
-  
+
   return cleaned;
 }
 
@@ -305,13 +304,13 @@ app.get("/all", async (req, res) => {
   try {
     const markets = await getCachedMarkets();
     // Filter out markets where probability is null, undefined, or NaN
-    // Also filter out cryptocurrency-related markets
+    // Also filter out markets containing filtered terms
     const validMarkets = markets.filter(
       (market) =>
         market.probability !== null &&
         market.probability !== undefined &&
         !isNaN(market.probability) &&
-        !containsCryptoTerms(market.title)
+        !containsFilteredTerms(market.title)
     );
     res.json(validMarkets);
   } catch (error) {
@@ -326,13 +325,13 @@ app.get("/random", async (req, res) => {
   try {
     const markets = await getCachedMarkets();
     // Filter out markets where probability is null, undefined, or NaN
-    // Also filter out cryptocurrency-related markets
+    // Also filter out markets containing filtered terms
     const validMarkets = markets.filter(
       (market) =>
         market.probability !== null &&
         market.probability !== undefined &&
         !isNaN(market.probability) &&
-        !containsCryptoTerms(market.title)
+        !containsFilteredTerms(market.title)
     );
 
     if (validMarkets.length === 0) {
