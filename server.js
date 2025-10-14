@@ -135,7 +135,7 @@ async function formatTitleWithGPT(question, answer) {
         {
           role: "system",
           content:
-            "You are a helpful assistant that formats prediction market questions and answers into clear, concise, and engaging titles. Convert the question and answer into a natural 'Will [answer] [action]?' format when possible. Always end with a question mark if the title sounds like a question (e.g., starts with 'Will', 'Can', 'Did', 'Is', 'Does', etc.). Keep them under 80 characters. Use sentence case capitalization."
+            "You are a helpful assistant that formats prediction market questions and answers into clear, concise, and engaging titles. Convert the question and answer into a natural 'Will [answer] [action]?' format when possible. IMPORTANT: If the title starts with 'Will', 'Can', 'Did', 'Is', 'Does', 'Should', 'Could', or any other question word, you MUST end it with a question mark (?). Keep them under 80 characters. Use sentence case capitalization."
         },
         {
           role: "user",
@@ -145,7 +145,16 @@ async function formatTitleWithGPT(question, answer) {
       max_completion_tokens: 100
     });
 
-    return response.choices[0].message.content.trim();
+    let formattedTitle = response.choices[0].message.content.trim();
+    
+    // Safety check: Add question mark if title starts with a question word but doesn't end with one
+    const questionWords = ['Will', 'Can', 'Did', 'Is', 'Does', 'Should', 'Could', 'Would', 'Has', 'Have', 'Are', 'Was', 'Were'];
+    const startsWithQuestionWord = questionWords.some(word => formattedTitle.startsWith(word + ' '));
+    if (startsWithQuestionWord && !formattedTitle.endsWith('?')) {
+      formattedTitle += '?';
+    }
+    
+    return formattedTitle;
   } catch (error) {
     console.error(
       `Error formatting question "${question}" with answer "${answer}":`,
