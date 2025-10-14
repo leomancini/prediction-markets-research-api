@@ -12,6 +12,7 @@ const openai = new OpenAI();
 
 // Cache configuration
 const CACHE_DURATION = 60 * 60 * 1000; // 1 hour in milliseconds
+const MAX_MARKETS = 100; // Maximum number of markets to process
 let cachedMarkets = null;
 let cacheTimestamp = null;
 
@@ -146,14 +147,30 @@ async function formatTitleWithGPT(question, answer) {
     });
 
     let formattedTitle = response.choices[0].message.content.trim();
-    
+
     // Safety check: Add question mark if title starts with a question word but doesn't end with one
-    const questionWords = ['Will', 'Can', 'Did', 'Is', 'Does', 'Should', 'Could', 'Would', 'Has', 'Have', 'Are', 'Was', 'Were'];
-    const startsWithQuestionWord = questionWords.some(word => formattedTitle.startsWith(word + ' '));
-    if (startsWithQuestionWord && !formattedTitle.endsWith('?')) {
-      formattedTitle += '?';
+    const questionWords = [
+      "Will",
+      "Can",
+      "Did",
+      "Is",
+      "Does",
+      "Should",
+      "Could",
+      "Would",
+      "Has",
+      "Have",
+      "Are",
+      "Was",
+      "Were"
+    ];
+    const startsWithQuestionWord = questionWords.some((word) =>
+      formattedTitle.startsWith(word + " ")
+    );
+    if (startsWithQuestionWord && !formattedTitle.endsWith("?")) {
+      formattedTitle += "?";
     }
-    
+
     return formattedTitle;
   } catch (error) {
     console.error(
@@ -182,6 +199,11 @@ async function scrapePolymarketMarkets() {
 
     // Find all market cards - they have this distinctive class structure
     $("div.transition.rounded-md.shadow-md").each((index, element) => {
+      // Stop if we've reached the maximum number of markets
+      if (markets.length >= MAX_MARKETS) {
+        return false; // Break out of the .each() loop
+      }
+
       const $card = $(element);
 
       // Extract market title
@@ -253,8 +275,8 @@ async function scrapePolymarketMarkets() {
               ? `${cleanedTitle} by ${name}`
               : `${title} - ${name}`;
 
-            // Only add if we haven't seen this title before
-            if (!seenTitles.has(fullTitle)) {
+            // Only add if we haven't seen this title before and haven't hit the limit
+            if (!seenTitles.has(fullTitle) && markets.length < MAX_MARKETS) {
               seenTitles.add(fullTitle);
               const decimalPercent =
                 parseInt(probability.replace("%", "")) / 100;
@@ -279,8 +301,8 @@ async function scrapePolymarketMarkets() {
 
           // Only add markets that have valid data
           if (title && volume && probability) {
-            // Only add if we haven't seen this title before
-            if (!seenTitles.has(title)) {
+            // Only add if we haven't seen this title before and haven't hit the limit
+            if (!seenTitles.has(title) && markets.length < MAX_MARKETS) {
               seenTitles.add(title);
               const decimalPercent =
                 parseInt(probability.replace("%", "")) / 100;
@@ -305,11 +327,13 @@ async function scrapePolymarketMarkets() {
 
 // Function to process markets with GPT formatting
 async function processMarketsWithGPT(markets) {
-  console.log(`Processing ${markets.length} markets with GPT...`);
+  // Limit to MAX_MARKETS
+  const marketsToProcess = markets.slice(0, MAX_MARKETS);
+  console.log(`Processing ${marketsToProcess.length} markets with GPT...`);
 
   // Process all titles in parallel with Promise.all
   const processedMarkets = await Promise.all(
-    markets.map(async (market) => {
+    marketsToProcess.map(async (market) => {
       const formattedTitle = await formatTitleWithGPT(
         market.question,
         market.prediction
@@ -399,7 +423,8 @@ app.get("/all", async (req, res) => {
         !isNaN(market.probability) &&
         !containsFilteredTerms(market.question)
     );
-    res.json(validMarkets);
+    // Limit to MAX_MARKETS
+    res.json(validMarkets.slice(0, MAX_MARKETS));
   } catch (error) {
     res.status(500).json({
       error: error.message
@@ -413,13 +438,15 @@ app.get("/random", async (req, res) => {
     const markets = await getCachedMarkets();
     // Filter out markets where probability is null, undefined, or NaN
     // Also filter out markets containing filtered terms (check question)
-    const validMarkets = markets.filter(
-      (market) =>
-        market.probability !== null &&
-        market.probability !== undefined &&
-        !isNaN(market.probability) &&
-        !containsFilteredTerms(market.question)
-    );
+    const validMarkets = markets
+      .filter(
+        (market) =>
+          market.probability !== null &&
+          market.probability !== undefined &&
+          !isNaN(market.probability) &&
+          !containsFilteredTerms(market.question)
+      )
+      .slice(0, MAX_MARKETS); // Limit to MAX_MARKETS
 
     if (validMarkets.length === 0) {
       return res.status(404).json({
