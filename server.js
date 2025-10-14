@@ -1,9 +1,14 @@
+import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
+import OpenAI from "openai";
 
 const app = express();
 const port = 3111;
+
+// Initialize OpenAI
+const openai = new OpenAI();
 
 // Cache configuration
 const CACHE_DURATION = 60 * 60 * 1000; // 1 hour in milliseconds
@@ -121,6 +126,36 @@ function cleanTitle(title) {
   return cleaned;
 }
 
+// Function to format a title using GPT
+async function formatTitleWithGPT(question, answer) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4.1-nano",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a helpful assistant that formats prediction market questions and answers into clear, concise, and engaging titles. Convert the question and answer into a natural 'Will [answer] [action]?' format when possible. Always end with a question mark if the title sounds like a question (e.g., starts with 'Will', 'Can', 'Did', 'Is', 'Does', etc.). Keep them under 80 characters. Use sentence case capitalization."
+        },
+        {
+          role: "user",
+          content: `Format this prediction market into a clear and engaging question:\nQuestion: "${question}"\nAnswer: "${answer}"\n\nExamples:\nQuestion: "Who will win the 2025 national heads-up poker championship?"\nAnswer: "Sean Winter"\nOutput: "Will Sean Winter win the 2025 national heads-up poker championship?"\n\nQuestion: "New York City mayoral election"\nAnswer: "Zohran Mamdani"\nOutput: "Will Zohran Mamdani win the New York City mayoral election?"\n\nQuestion: "Powell mention employment or unemployment 15+ times during his October 14 speech"\nAnswer: "Yes"\nOutput: "Will Powell mention employment or unemployment 15 times during his October 14 speech?"\n\nRespond with just the formatted question, no quotes around it.`
+        }
+      ],
+      max_completion_tokens: 100
+    });
+
+    return response.choices[0].message.content.trim();
+  } catch (error) {
+    console.error(
+      `Error formatting question "${question}" with answer "${answer}":`,
+      error
+    );
+    // Return combined question and answer if GPT fails
+    return `${question} - ${answer}`;
+  }
+}
+
 // Function to scrape Polymarket markets
 async function scrapePolymarketMarkets() {
   try {
@@ -215,7 +250,8 @@ async function scrapePolymarketMarkets() {
               const decimalPercent =
                 parseInt(probability.replace("%", "")) / 100;
               markets.push({
-                title: fullTitle,
+                question: cleanedTitle,
+                prediction: name,
                 probability: decimalPercent,
                 volume
               });
@@ -240,7 +276,8 @@ async function scrapePolymarketMarkets() {
               const decimalPercent =
                 parseInt(probability.replace("%", "")) / 100;
               markets.push({
-                title,
+                question: title,
+                prediction: "Yes",
                 probability: decimalPercent,
                 volume
               });
@@ -257,6 +294,33 @@ async function scrapePolymarketMarkets() {
   }
 }
 
+// Function to process markets with GPT formatting
+async function processMarketsWithGPT(markets) {
+  console.log(`Processing ${markets.length} markets with GPT...`);
+
+  // Process all titles in parallel with Promise.all
+  const processedMarkets = await Promise.all(
+    markets.map(async (market) => {
+      const formattedTitle = await formatTitleWithGPT(
+        market.question,
+        market.prediction
+      );
+      return {
+        title: formattedTitle,
+        question: market.question,
+        prediction: market.prediction,
+        probability: market.probability,
+        volume: market.volume
+      };
+    })
+  );
+
+  console.log(
+    `Finished processing ${processedMarkets.length} markets with GPT`
+  );
+  return processedMarkets;
+}
+
 // Function to get cached markets with background refresh
 async function getCachedMarkets() {
   const now = Date.now();
@@ -265,14 +329,24 @@ async function getCachedMarkets() {
 
   // If no cache exists at all, fetch synchronously (first time)
   if (!cachedMarkets) {
-    cachedMarkets = await scrapePolymarketMarkets();
+    console.log(
+      "No cache found. Fetching and processing markets for the first time..."
+    );
+    const markets = await scrapePolymarketMarkets();
+    cachedMarkets = await processMarketsWithGPT(markets);
     cacheTimestamp = now;
+    console.log("Initial cache populated successfully");
 
     return cachedMarkets;
   }
 
   // If cache is expired, refresh in background but return stale data immediately
   if (isCacheExpired) {
+    const cacheAge = Math.round((now - cacheTimestamp) / 1000 / 60); // minutes
+    console.log(
+      `Cache expired (${cacheAge} minutes old). Returning stale data and refreshing in background...`
+    );
+
     // Refresh cache in background (don't await)
     refreshCacheInBackground();
 
@@ -280,15 +354,19 @@ async function getCachedMarkets() {
     return cachedMarkets;
   }
 
+  // Cache is fresh
   return cachedMarkets;
 }
 
 // Background cache refresh function
 async function refreshCacheInBackground() {
   try {
+    console.log("Starting background cache refresh...");
     const freshMarkets = await scrapePolymarketMarkets();
-    cachedMarkets = freshMarkets;
+    const processedMarkets = await processMarketsWithGPT(freshMarkets);
+    cachedMarkets = processedMarkets;
     cacheTimestamp = Date.now();
+    console.log("Background cache refresh completed successfully");
   } catch (error) {
     console.error("Background cache refresh failed:", error);
     // Keep the old cache if refresh fails
@@ -304,13 +382,13 @@ app.get("/all", async (req, res) => {
   try {
     const markets = await getCachedMarkets();
     // Filter out markets where probability is null, undefined, or NaN
-    // Also filter out markets containing filtered terms
+    // Also filter out markets containing filtered terms (check question)
     const validMarkets = markets.filter(
       (market) =>
         market.probability !== null &&
         market.probability !== undefined &&
         !isNaN(market.probability) &&
-        !containsFilteredTerms(market.title)
+        !containsFilteredTerms(market.question)
     );
     res.json(validMarkets);
   } catch (error) {
@@ -325,13 +403,13 @@ app.get("/random", async (req, res) => {
   try {
     const markets = await getCachedMarkets();
     // Filter out markets where probability is null, undefined, or NaN
-    // Also filter out markets containing filtered terms
+    // Also filter out markets containing filtered terms (check question)
     const validMarkets = markets.filter(
       (market) =>
         market.probability !== null &&
         market.probability !== undefined &&
         !isNaN(market.probability) &&
-        !containsFilteredTerms(market.title)
+        !containsFilteredTerms(market.question)
     );
 
     if (validMarkets.length === 0) {
