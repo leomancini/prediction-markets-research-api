@@ -1,7 +1,6 @@
 import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
-import * as cheerio from "cheerio";
 import OpenAI from "openai";
 
 const app = express();
@@ -182,145 +181,68 @@ async function formatTitleWithGPT(question, answer) {
   }
 }
 
-// Function to scrape Polymarket markets
+// Function to fetch Polymarket markets via their API
 async function scrapePolymarketMarkets() {
   try {
-    const response = await fetch("https://polymarket.com/", {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-      }
-    });
+    const response = await fetch(
+      "https://gamma-api.polymarket.com/events?limit=50&active=true&closed=false&order=volume&ascending=false"
+    );
 
-    const html = await response.text();
-    const $ = cheerio.load(html);
+    const events = await response.json();
     const markets = [];
-    const seenTitles = new Set(); // Track titles we've already processed
+    const seenTitles = new Set();
 
-    // Find all market cards - they have this distinctive class structure
-    $("div.transition.rounded-md.shadow-md").each((index, element) => {
-      // Stop if we've reached the maximum number of markets
-      if (markets.length >= MAX_MARKETS) {
-        return false; // Break out of the .each() loop
-      }
+    for (const event of events) {
+      if (markets.length >= MAX_MARKETS) break;
 
-      const $card = $(element);
+      const eventMarkets = event.markets || [];
+      const isMultiOption = eventMarkets.length > 1;
 
-      // Extract market title
-      const titleElement = $card.find("p.text-sm.font-semibold").first();
-      let title = cleanTitle(titleElement.text().trim());
+      for (const market of eventMarkets) {
+        if (markets.length >= MAX_MARKETS) break;
 
-      // Clean up title format - remove " by...?" for multi-option markets
-      const cleanedTitle = title.replace(/ by\.\.\.\?$/g, "");
+        const outcomes = JSON.parse(market.outcomes || "[]");
+        const outcomePrices = JSON.parse(market.outcomePrices || "[]");
+        const volume = Math.round(market.volumeNum || parseFloat(market.volume) || 0);
 
-      // Extract market link
-      const linkElement = $card.find('a[href^="/event/"]').first();
-      const link = linkElement.attr("href");
+        if (!outcomes.length || !outcomePrices.length || !volume) continue;
 
-      // Extract market image
-      const imgElement = $card.find("img").first();
-      const image =
-        imgElement.attr("src") || imgElement.attr("srcset")?.split(" ")[0];
+        const probability = parseFloat(outcomePrices[0]);
+        if (isNaN(probability)) continue;
 
-      // Extract volume information
-      const volumeElement = $card.find('p:contains("Vol.")');
-      const volumeText = volumeElement.text().trim();
+        // For binary Yes/No markets, use the event title as the question
+        // For multi-option markets, use event title as question and extract prediction from market question
+        let question = cleanTitle(event.title || market.question || "");
+        let prediction;
 
-      // Convert volume to integer (e.g., "$16m Vol." -> 16000000)
-      let volume = 0;
-      if (volumeText) {
-        const match = volumeText.match(/\$?([0-9.]+)([kmb]?)/i);
-        if (match) {
-          const number = parseFloat(match[1]);
-          const unit = match[2].toLowerCase();
-
-          switch (unit) {
-            case "k":
-              volume = Math.round(number * 1000);
-              break;
-            case "m":
-              volume = Math.round(number * 1000000);
-              break;
-            case "b":
-              volume = Math.round(number * 1000000000);
-              break;
-            default:
-              volume = Math.round(number);
-          }
+        if (isMultiOption) {
+          // Extract the specific option from the market question
+          // e.g., "Will Stephen A. Smith win the 2028 Democratic presidential nomination?" → "Stephen A. Smith"
+          const marketQuestion = market.question || "";
+          const willMatch = marketQuestion.match(/^Will (.+?)(?:\s+win\b|\s+be\b|\s+become\b|\s+qualify\b)/i);
+          prediction = willMatch ? cleanTitle(willMatch[1]) : cleanTitle(outcomes[0]);
+        } else {
+          prediction = "Yes";
         }
-      }
 
-      // Extract betting options with probabilities
+        if (!question || !prediction) continue;
 
-      // Check for multi-option markets (like "Democratic Presidential Nominee 2028")
-      const multiOptionElements = $card.find(
-        "div.flex.justify-between.items-center.gap-4.w-full.h-fit.shrink-0"
-      );
+        const titleKey = `${question}-${prediction}`;
+        if (seenTitles.has(titleKey)) continue;
+        seenTitles.add(titleKey);
 
-      if (multiOptionElements.length > 0) {
-        // For multi-option markets, create separate entries for each option (max 5)
-        multiOptionElements.slice(0, 5).each((i, optionEl) => {
-          const $option = $(optionEl);
-          const nameEl = $option.find("p.line-clamp-1.text-\\[13px\\]").first();
-          const probabilityEl = $option
-            .find("p.font-semibold.text-text-primary.mr-1")
-            .first();
-
-          const name = cleanTitle(nameEl.text().trim());
-          const probability = probabilityEl.text().trim();
-
-          if (name && probability && title && volume) {
-            // Use "by" format only if original title contained " by...?"
-            const fullTitle = title.includes(" by...?")
-              ? `${cleanedTitle} by ${name}`
-              : `${title} - ${name}`;
-
-            // Only add if we haven't seen this title before and haven't hit the limit
-            if (!seenTitles.has(fullTitle) && markets.length < MAX_MARKETS) {
-              seenTitles.add(fullTitle);
-              const decimalPercent =
-                parseInt(probability.replace("%", "")) / 100;
-              markets.push({
-                question: cleanedTitle,
-                prediction: name,
-                probability: decimalPercent,
-                volume
-              });
-            }
-          }
+        markets.push({
+          question,
+          prediction,
+          probability,
+          volume
         });
-      } else {
-        // Check for binary prediction markets (like "Russia x Ukraine ceasefire in 2025?")
-        const chanceElement = $card
-          .find("p.font-medium.text-\\[16px\\].text-center")
-          .first();
-        const chanceTextElement = $card.find('p:contains("chance")').first();
-
-        if (chanceElement.length && chanceTextElement.length) {
-          const probability = chanceElement.text().trim();
-
-          // Only add markets that have valid data
-          if (title && volume && probability) {
-            // Only add if we haven't seen this title before and haven't hit the limit
-            if (!seenTitles.has(title) && markets.length < MAX_MARKETS) {
-              seenTitles.add(title);
-              const decimalPercent =
-                parseInt(probability.replace("%", "")) / 100;
-              markets.push({
-                question: title,
-                prediction: "Yes",
-                probability: decimalPercent,
-                volume
-              });
-            }
-          }
-        }
       }
-    });
+    }
 
     return markets;
   } catch (error) {
-    console.error("Error scraping Polymarket:", error);
+    console.error("Error fetching Polymarket markets:", error);
     throw error;
   }
 }
