@@ -2,6 +2,8 @@ import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
 import OpenAI from "openai";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 const app = express();
 const port = 3111;
@@ -386,6 +388,102 @@ app.get("/random", async (req, res) => {
       error: error.message
     });
   }
+});
+
+// Helper: return valid, filtered markets (same logic as /all and /random)
+async function getFilteredMarkets() {
+  const markets = await getCachedMarkets();
+  return markets
+    .filter(
+      (market) =>
+        market.probability !== null &&
+        market.probability !== undefined &&
+        !isNaN(market.probability) &&
+        !containsFilteredTerms(market.question)
+    )
+    .slice(0, MAX_MARKETS);
+}
+
+// Build MCP server exposing the same data as the REST endpoints
+function buildMcpServer() {
+  const server = new McpServer({
+    name: "prediction-markets-research",
+    version: "1.0.0"
+  });
+
+  server.tool(
+    "get_all_markets",
+    "Get all cached Polymarket prediction markets (filtered, up to 100).",
+    {},
+    async () => {
+      const markets = await getFilteredMarkets();
+      return {
+        content: [{ type: "text", text: JSON.stringify(markets, null, 2) }]
+      };
+    }
+  );
+
+  server.tool(
+    "get_random_market",
+    "Get one random Polymarket prediction market from the filtered set.",
+    {},
+    async () => {
+      const markets = await getFilteredMarkets();
+      if (markets.length === 0) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "No valid markets found" }]
+        };
+      }
+      const random = markets[Math.floor(Math.random() * markets.length)];
+      return {
+        content: [{ type: "text", text: JSON.stringify(random, null, 2) }]
+      };
+    }
+  );
+
+  return server;
+}
+
+// MCP endpoint (stateless Streamable HTTP transport)
+app.post("/mcp", express.json(), async (req, res) => {
+  try {
+    const server = buildMcpServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined
+    });
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error("MCP request error:", error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: null
+      });
+    }
+  }
+});
+
+// Reject GET/DELETE on /mcp in stateless mode with a proper JSON-RPC error
+app.get("/mcp", (req, res) => {
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method not allowed." },
+    id: null
+  });
+});
+app.delete("/mcp", (req, res) => {
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method not allowed." },
+    id: null
+  });
 });
 
 app.listen(port, () => {

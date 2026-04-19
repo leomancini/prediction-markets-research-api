@@ -11,13 +11,15 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "cheerio": "^1.0.0-rc.12",
     "dotenv": "^17.2.3",
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
     "openai": "^6.3.0",
     "path": "^0.12.7",
-    "url": "^0.11.3"
+    "url": "^0.11.3",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"
