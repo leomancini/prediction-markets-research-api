@@ -8,6 +8,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 const app = express();
 const port = 3111;
 
+app.use(express.json());
+
 // Initialize OpenAI
 const openai = new OpenAI();
 
@@ -445,8 +447,7 @@ function buildMcpServer() {
   return server;
 }
 
-// MCP endpoint (stateless Streamable HTTP transport)
-app.post("/mcp", express.json(), async (req, res) => {
+app.post("/mcp", async (req, res) => {
   try {
     const server = buildMcpServer();
     const transport = new StreamableHTTPServerTransport({
@@ -459,7 +460,7 @@ app.post("/mcp", express.json(), async (req, res) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
-    console.error("MCP request error:", error);
+    console.error("MCP error:", error);
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: "2.0",
@@ -470,15 +471,7 @@ app.post("/mcp", express.json(), async (req, res) => {
   }
 });
 
-// Reject GET/DELETE on /mcp in stateless mode with a proper JSON-RPC error
 app.get("/mcp", (req, res) => {
-  res.status(405).json({
-    jsonrpc: "2.0",
-    error: { code: -32000, message: "Method not allowed." },
-    id: null
-  });
-});
-app.delete("/mcp", (req, res) => {
   res.status(405).json({
     jsonrpc: "2.0",
     error: { code: -32000, message: "Method not allowed." },
