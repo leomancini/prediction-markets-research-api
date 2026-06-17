@@ -420,6 +420,15 @@ app.get("/all", async (req, res) => {
   }
 });
 
+// Identity key for a market (probability can drift, but question+prediction
+// uniquely identifies it — same key used for dedupe during scraping).
+function marketKey(market) {
+  return `${market.question}-${market.prediction}`;
+}
+
+// Track the last market returned by /random so we never repeat it back-to-back.
+let lastRandomKey = null;
+
 // API endpoint to get a random market.
 // Honors the same ?min=X&max=Y probability filter as /all.
 app.get("/random", async (req, res) => {
@@ -434,9 +443,18 @@ app.get("/random", async (req, res) => {
       });
     }
 
-    // Get a random market from the filtered array
-    const randomIndex = Math.floor(Math.random() * validMarkets.length);
-    const randomMarket = validMarkets[randomIndex];
+    // Exclude the previously returned market so we don't repeat twice in a row.
+    // Only filter when there's an alternative, so a single-result set still works.
+    let candidates = validMarkets;
+    if (validMarkets.length > 1 && lastRandomKey !== null) {
+      const filtered = validMarkets.filter((m) => marketKey(m) !== lastRandomKey);
+      if (filtered.length > 0) candidates = filtered;
+    }
+
+    // Get a random market from the candidate array
+    const randomIndex = Math.floor(Math.random() * candidates.length);
+    const randomMarket = candidates[randomIndex];
+    lastRandomKey = marketKey(randomMarket);
 
     res.json(randomMarket);
   } catch (error) {
