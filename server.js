@@ -426,8 +426,13 @@ function marketKey(market) {
   return `${market.question}-${market.prediction}`;
 }
 
-// Track the last market returned by /random so we never repeat it back-to-back.
-let lastRandomKey = null;
+// Minimum probability gap (10 percentage points) between consecutive /random
+// results, so we don't show two numerically similar markets back-to-back.
+const MIN_PROB_DELTA = 0.1;
+
+// Track the last market returned by /random (key + probability) so we never
+// repeat it back-to-back and can favor a meaningfully different probability.
+let lastRandom = null;
 
 // API endpoint to get a random market.
 // Honors the same ?min=X&max=Y probability filter as /all.
@@ -443,18 +448,28 @@ app.get("/random", async (req, res) => {
       });
     }
 
-    // Exclude the previously returned market so we don't repeat twice in a row.
-    // Only filter when there's an alternative, so a single-result set still works.
+    // Narrow the pool relative to the last result, each step only applied when
+    // it leaves at least one candidate — so we always return something.
     let candidates = validMarkets;
-    if (validMarkets.length > 1 && lastRandomKey !== null) {
-      const filtered = validMarkets.filter((m) => marketKey(m) !== lastRandomKey);
-      if (filtered.length > 0) candidates = filtered;
+    if (lastRandom !== null && candidates.length > 1) {
+      // 1. Never repeat the exact same market twice in a row.
+      const notSame = candidates.filter((m) => marketKey(m) !== lastRandom.key);
+      if (notSame.length > 0) candidates = notSame;
+
+      // 2. Prefer a probability at least MIN_PROB_DELTA away from the last one.
+      const distinct = candidates.filter(
+        (m) => Math.abs(m.probability - lastRandom.probability) >= MIN_PROB_DELTA
+      );
+      if (distinct.length > 0) candidates = distinct;
     }
 
     // Get a random market from the candidate array
     const randomIndex = Math.floor(Math.random() * candidates.length);
     const randomMarket = candidates[randomIndex];
-    lastRandomKey = marketKey(randomMarket);
+    lastRandom = {
+      key: marketKey(randomMarket),
+      probability: randomMarket.probability
+    };
 
     res.json(randomMarket);
   } catch (error) {
