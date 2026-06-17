@@ -15,7 +15,9 @@ const openai = new OpenAI();
 
 // Cache configuration
 const CACHE_DURATION = 60 * 60 * 1000; // 1 hour in milliseconds
-const MAX_MARKETS = 100; // Maximum number of markets to process
+const MAX_MARKETS = 250; // Maximum number of markets to process
+const MAX_EVENTS = 150; // Number of Polymarket events to fetch (by volume)
+const MAX_SUBMARKETS_PER_EVENT = 2; // Cap options taken from a multi-option event
 let cachedMarkets = null;
 let cacheTimestamp = null;
 
@@ -185,14 +187,70 @@ async function formatTitleWithGPT(question, answer) {
   }
 }
 
+// Fetch the top events by volume from Polymarket's Gamma API.
+// The API caps a single page at 100, so paginate until we have MAX_EVENTS.
+async function fetchTopEvents() {
+  const PAGE_SIZE = 100;
+  const events = [];
+
+  for (let offset = 0; offset < MAX_EVENTS; offset += PAGE_SIZE) {
+    const limit = Math.min(PAGE_SIZE, MAX_EVENTS - offset);
+    const response = await fetch(
+      `https://gamma-api.polymarket.com/events?limit=${limit}&offset=${offset}&active=true&closed=false&order=volume&ascending=false`
+    );
+    const page = await response.json();
+    if (!Array.isArray(page) || page.length === 0) break;
+    events.push(...page);
+    if (page.length < limit) break; // No more events available
+  }
+
+  return events.slice(0, MAX_EVENTS);
+}
+
+// Parse a single Polymarket market into our shape, or return null if invalid.
+// `eventTitle` is used as the question for multi-option events.
+function parseMarket(market, eventTitle, isMultiOption) {
+  const outcomes = JSON.parse(market.outcomes || "[]");
+  const outcomePrices = JSON.parse(market.outcomePrices || "[]");
+  const volume = Math.round(market.volumeNum || parseFloat(market.volume) || 0);
+
+  if (!outcomes.length || !outcomePrices.length || !volume) return null;
+
+  const probability = parseFloat(outcomePrices[0]);
+  if (isNaN(probability)) return null;
+
+  // For binary Yes/No markets, use the event title as the question.
+  // For multi-option markets, use the event title as the question and the
+  // option label (groupItemTitle) as the prediction.
+  const question = cleanTitle(eventTitle || market.question || "");
+  let prediction;
+
+  if (isMultiOption) {
+    // groupItemTitle is the clean per-option label Polymarket uses for both
+    // winner-takes-all markets ("Spain") and grouped Yes/No markets
+    // ("Troop Withdrawal"). Fall back to the older heuristics if it's absent.
+    if (market.groupItemTitle) {
+      prediction = cleanTitle(market.groupItemTitle);
+    } else {
+      const marketQuestion = market.question || "";
+      const willMatch = marketQuestion.match(
+        /^Will (.+?)(?:\s+win\b|\s+be\b|\s+become\b|\s+qualify\b)/i
+      );
+      prediction = willMatch ? cleanTitle(willMatch[1]) : cleanTitle(outcomes[0]);
+    }
+  } else {
+    prediction = "Yes";
+  }
+
+  if (!question || !prediction) return null;
+
+  return { question, prediction, probability, volume };
+}
+
 // Function to fetch Polymarket markets via their API
 async function scrapePolymarketMarkets() {
   try {
-    const response = await fetch(
-      "https://gamma-api.polymarket.com/events?limit=50&active=true&closed=false&order=volume&ascending=false"
-    );
-
-    const events = await response.json();
+    const events = await fetchTopEvents();
     const markets = [];
     const seenTitles = new Set();
 
@@ -202,45 +260,27 @@ async function scrapePolymarketMarkets() {
       const eventMarkets = event.markets || [];
       const isMultiOption = eventMarkets.length > 1;
 
-      for (const market of eventMarkets) {
+      // Parse and keep only valid markets for this event.
+      let parsed = eventMarkets
+        .map((m) => parseMarket(m, event.title, isMultiOption))
+        .filter(Boolean);
+
+      // For multi-option events, cap the number of options we keep, taking the
+      // highest-volume ones so a single large event can't dominate the feed.
+      if (isMultiOption && parsed.length > MAX_SUBMARKETS_PER_EVENT) {
+        parsed = parsed
+          .sort((a, b) => b.volume - a.volume)
+          .slice(0, MAX_SUBMARKETS_PER_EVENT);
+      }
+
+      for (const market of parsed) {
         if (markets.length >= MAX_MARKETS) break;
 
-        const outcomes = JSON.parse(market.outcomes || "[]");
-        const outcomePrices = JSON.parse(market.outcomePrices || "[]");
-        const volume = Math.round(market.volumeNum || parseFloat(market.volume) || 0);
-
-        if (!outcomes.length || !outcomePrices.length || !volume) continue;
-
-        const probability = parseFloat(outcomePrices[0]);
-        if (isNaN(probability)) continue;
-
-        // For binary Yes/No markets, use the event title as the question
-        // For multi-option markets, use event title as question and extract prediction from market question
-        let question = cleanTitle(event.title || market.question || "");
-        let prediction;
-
-        if (isMultiOption) {
-          // Extract the specific option from the market question
-          // e.g., "Will Stephen A. Smith win the 2028 Democratic presidential nomination?" → "Stephen A. Smith"
-          const marketQuestion = market.question || "";
-          const willMatch = marketQuestion.match(/^Will (.+?)(?:\s+win\b|\s+be\b|\s+become\b|\s+qualify\b)/i);
-          prediction = willMatch ? cleanTitle(willMatch[1]) : cleanTitle(outcomes[0]);
-        } else {
-          prediction = "Yes";
-        }
-
-        if (!question || !prediction) continue;
-
-        const titleKey = `${question}-${prediction}`;
+        const titleKey = `${market.question}-${market.prediction}`;
         if (seenTitles.has(titleKey)) continue;
         seenTitles.add(titleKey);
 
-        markets.push({
-          question,
-          prediction,
-          probability,
-          volume
-        });
+        markets.push(market);
       }
     }
 
@@ -336,21 +376,43 @@ app.get("/", (req, res) => {
   res.send("Hello world!");
 });
 
-// API endpoint to get scraped markets
-app.get("/all", async (req, res) => {
-  try {
-    const markets = await getCachedMarkets();
-    // Filter out markets where probability is null, undefined, or NaN
-    // Also filter out markets containing filtered terms (check question)
-    const validMarkets = markets.filter(
+// Parse `min`/`max` query params (percentages, 0-100) into a probability
+// range (0-1). Invalid or missing values are ignored. Returns { min, max }.
+function parseProbabilityRange(query) {
+  const toProbability = (raw) => {
+    if (raw === undefined) return undefined;
+    const pct = parseFloat(raw);
+    if (isNaN(pct)) return undefined;
+    return Math.min(100, Math.max(0, pct)) / 100;
+  };
+  return { min: toProbability(query.min), max: toProbability(query.max) };
+}
+
+// Helper: return valid, filtered markets (shared by /all, /random, and MCP).
+// Optionally constrain to a probability range via { min, max } in 0-1.
+async function getFilteredMarkets({ min, max } = {}) {
+  const markets = await getCachedMarkets();
+  return markets
+    .filter(
       (market) =>
         market.probability !== null &&
         market.probability !== undefined &&
         !isNaN(market.probability) &&
-        !containsFilteredTerms(market.question)
+        !containsFilteredTerms(market.question) &&
+        (min === undefined || market.probability >= min) &&
+        (max === undefined || market.probability <= max)
+    )
+    .slice(0, MAX_MARKETS);
+}
+
+// API endpoint to get scraped markets.
+// Optional query params: ?min=X&max=Y (percentages) to bound probability.
+app.get("/all", async (req, res) => {
+  try {
+    const validMarkets = await getFilteredMarkets(
+      parseProbabilityRange(req.query)
     );
-    // Limit to MAX_MARKETS
-    res.json(validMarkets.slice(0, MAX_MARKETS));
+    res.json(validMarkets);
   } catch (error) {
     res.status(500).json({
       error: error.message
@@ -358,21 +420,13 @@ app.get("/all", async (req, res) => {
   }
 });
 
-// API endpoint to get a random market
+// API endpoint to get a random market.
+// Honors the same ?min=X&max=Y probability filter as /all.
 app.get("/random", async (req, res) => {
   try {
-    const markets = await getCachedMarkets();
-    // Filter out markets where probability is null, undefined, or NaN
-    // Also filter out markets containing filtered terms (check question)
-    const validMarkets = markets
-      .filter(
-        (market) =>
-          market.probability !== null &&
-          market.probability !== undefined &&
-          !isNaN(market.probability) &&
-          !containsFilteredTerms(market.question)
-      )
-      .slice(0, MAX_MARKETS); // Limit to MAX_MARKETS
+    const validMarkets = await getFilteredMarkets(
+      parseProbabilityRange(req.query)
+    );
 
     if (validMarkets.length === 0) {
       return res.status(404).json({
@@ -391,20 +445,6 @@ app.get("/random", async (req, res) => {
     });
   }
 });
-
-// Helper: return valid, filtered markets (same logic as /all and /random)
-async function getFilteredMarkets() {
-  const markets = await getCachedMarkets();
-  return markets
-    .filter(
-      (market) =>
-        market.probability !== null &&
-        market.probability !== undefined &&
-        !isNaN(market.probability) &&
-        !containsFilteredTerms(market.question)
-    )
-    .slice(0, MAX_MARKETS);
-}
 
 // Build MCP server exposing the same data as the REST endpoints
 function buildMcpServer() {
