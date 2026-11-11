@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
-import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
@@ -10,8 +10,9 @@ const port = 3111;
 
 app.use(express.json());
 
-// Initialize OpenAI
-const openai = new OpenAI();
+// Initialize the Claude API client (reads ANTHROPIC_API_KEY from .env)
+const anthropic = new Anthropic();
+const TITLE_MODEL = "claude-sonnet-5-5";
 
 // Cache configuration
 const CACHE_DURATION = 60 * 60 * 1000; // 1 hour in milliseconds
@@ -132,26 +133,55 @@ function cleanTitle(title) {
   return cleaned;
 }
 
-// Function to format a title using GPT
-async function formatTitleWithGPT(question, answer) {
+// Function to format a title using Claude
+async function formatTitleWithClaude(question, answer) {
   try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-4.1-nano",
+    const response = await anthropic.beta.messages.create({
+      model: TITLE_MODEL,
+      max_tokens: 1024,
+      // Short formatting task: keep thinking and token spend low.
+      // The reply is constrained to {"title": "..."} so the model cannot put
+      // notes about how it read the input in front of the title.
+      output_config: {
+        effort: "low",
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: { title: { type: "string" } },
+            required: ["title"],
+            additionalProperties: false
+          }
+        }
+      },
+      // If a safety classifier declines a request, let the API retry it on a
+      // fallback model instead of returning nothing.
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+      system:
+        "You are a helpful assistant that formats prediction market questions and answers into clear, concise, and engaging titles. Convert the question and answer into a natural 'Will [answer] [action]?' format when possible. IMPORTANT: If the title starts with 'Will', 'Can', 'Did', 'Is', 'Does', 'Should', 'Could', or any other question word, you MUST end it with a question mark (?). Keep them under 80 characters. Use sentence case capitalization. The answer text has had punctuation stripped, so a value like \"4 0\" may mean 4.0%: silently pick the most likely reading. The title field must contain only the final question, with no explanation, notes or reasoning.",
       messages: [
         {
-          role: "system",
-          content:
-            "You are a helpful assistant that formats prediction market questions and answers into clear, concise, and engaging titles. Convert the question and answer into a natural 'Will [answer] [action]?' format when possible. IMPORTANT: If the title starts with 'Will', 'Can', 'Did', 'Is', 'Does', 'Should', 'Could', or any other question word, you MUST end it with a question mark (?). Keep them under 80 characters. Use sentence case capitalization."
-        },
-        {
           role: "user",
-          content: `Format this prediction market into a clear and engaging question:\nQuestion: "${question}"\nAnswer: "${answer}"\n\nExamples:\nQuestion: "Who will win the 2025 national heads-up poker championship?"\nAnswer: "Sean Winter"\nOutput: "Will Sean Winter win the 2025 national heads-up poker championship?"\n\nQuestion: "New York City mayoral election"\nAnswer: "Zohran Mamdani"\nOutput: "Will Zohran Mamdani win the New York City mayoral election?"\n\nQuestion: "Powell mention employment or unemployment 15+ times during his October 14 speech"\nAnswer: "Yes"\nOutput: "Will Powell mention employment or unemployment 15 times during his October 14 speech?"\n\nRespond with just the formatted question, no quotes around it.`
+          content: `Format this prediction market into a clear and engaging question:\nQuestion: "${question}"\nAnswer: "${answer}"\n\nExamples:\nQuestion: "Who will win the 2025 national heads-up poker championship?"\nAnswer: "Sean Winter"\nOutput: "Will Sean Winter win the 2025 national heads-up poker championship?"\n\nQuestion: "New York City mayoral election"\nAnswer: "Zohran Mamdani"\nOutput: "Will Zohran Mamdani win the New York City mayoral election?"\n\nQuestion: "Powell mention employment or unemployment 15+ times during his October 14 speech"\nAnswer: "Yes"\nOutput: "Will Powell mention employment or unemployment 15 times during his October 14 speech?"\n\nRespond with just the formatted question.`
         }
-      ],
-      max_completion_tokens: 100
+      ]
     });
 
-    let formattedTitle = response.choices[0].message.content.trim();
+    if (response.stop_reason === "refusal") {
+      throw new Error("Claude declined to format this title");
+    }
+
+    const replyText = response.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("");
+    let formattedTitle = String(JSON.parse(replyText).title ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!formattedTitle) {
+      throw new Error("Claude returned no text");
+    }
 
     // Safety check: Add question mark if title starts with a question word but doesn't end with one
     const questionWords = [
@@ -178,33 +208,49 @@ async function formatTitleWithGPT(question, answer) {
 
     return formattedTitle;
   } catch (error) {
+    // Log one line per failure. Printing the whole error object dumps the full
+    // HTTP response and filled the error log when every request was failing.
+    const status = error instanceof Anthropic.APIError ? ` (HTTP ${error.status})` : "";
     console.error(
-      `Error formatting question "${question}" with answer "${answer}":`,
-      error
+      `Error formatting question "${question}" with answer "${answer}"${status}: ${error.message}`
     );
-    // Return combined question and answer if GPT fails
+    // Return combined question and answer if Claude fails
     return `${question} - ${answer}`;
   }
 }
 
-// Fetch the top events by volume from Polymarket's Gamma API.
-// The API caps a single page at 100, so paginate until we have MAX_EVENTS.
-async function fetchTopEvents() {
-  const PAGE_SIZE = 100;
-  const events = [];
+// Extract the valid, deduped markets from a single raw event, appending them
+// into `markets`. Returns true once MAX_MARKETS has been reached so the caller
+// can stop early. Keeping this per-event lets the caller discard each raw page
+// as soon as it's parsed instead of holding the whole feed in memory.
+function collectMarketsFromEvent(event, markets, seenTitles) {
+  const eventMarkets = event.markets || [];
+  const isMultiOption = eventMarkets.length > 1;
 
-  for (let offset = 0; offset < MAX_EVENTS; offset += PAGE_SIZE) {
-    const limit = Math.min(PAGE_SIZE, MAX_EVENTS - offset);
-    const response = await fetch(
-      `https://gamma-api.polymarket.com/events?limit=${limit}&offset=${offset}&active=true&closed=false&order=volume&ascending=false`
-    );
-    const page = await response.json();
-    if (!Array.isArray(page) || page.length === 0) break;
-    events.push(...page);
-    if (page.length < limit) break; // No more events available
+  // Parse and keep only valid markets for this event.
+  let parsed = eventMarkets
+    .map((m) => parseMarket(m, event.title, isMultiOption))
+    .filter(Boolean);
+
+  // For multi-option events, cap the number of options we keep, taking the
+  // highest-volume ones so a single large event can't dominate the feed.
+  if (isMultiOption && parsed.length > MAX_SUBMARKETS_PER_EVENT) {
+    parsed = parsed
+      .sort((a, b) => b.volume - a.volume)
+      .slice(0, MAX_SUBMARKETS_PER_EVENT);
   }
 
-  return events.slice(0, MAX_EVENTS);
+  for (const market of parsed) {
+    if (markets.length >= MAX_MARKETS) return true;
+
+    const titleKey = `${market.question}-${market.prediction}`;
+    if (seenTitles.has(titleKey)) continue;
+    seenTitles.add(titleKey);
+
+    markets.push(market);
+  }
+
+  return markets.length >= MAX_MARKETS;
 }
 
 // Parse a single Polymarket market into our shape, or return null if invalid.
@@ -247,41 +293,44 @@ function parseMarket(market, eventTitle, isMultiOption) {
   return { question, prediction, probability, volume };
 }
 
-// Function to fetch Polymarket markets via their API
+// Function to fetch Polymarket markets via their API.
+// The Gamma API caps a single page at 100, so we paginate until we have
+// MAX_EVENTS. Each raw page is parsed down to our slim market shape and then
+// dropped, so the fat raw event objects (full metadata, images, descriptions)
+// are never all held in memory at once and don't survive into Claude processing.
 async function scrapePolymarketMarkets() {
   try {
-    const events = await fetchTopEvents();
+    const PAGE_SIZE = 100;
     const markets = [];
     const seenTitles = new Set();
 
-    for (const event of events) {
-      if (markets.length >= MAX_MARKETS) break;
+    for (
+      let offset = 0;
+      offset < MAX_EVENTS && markets.length < MAX_MARKETS;
+      offset += PAGE_SIZE
+    ) {
+      const limit = Math.min(PAGE_SIZE, MAX_EVENTS - offset);
+      const response = await fetch(
+        `https://gamma-api.polymarket.com/events?limit=${limit}&offset=${offset}&active=true&closed=false&order=volume&ascending=false`
+      );
+      let page = await response.json();
+      if (!Array.isArray(page) || page.length === 0) break;
 
-      const eventMarkets = event.markets || [];
-      const isMultiOption = eventMarkets.length > 1;
+      const noMorePages = page.length < limit; // API returned fewer than asked
 
-      // Parse and keep only valid markets for this event.
-      let parsed = eventMarkets
-        .map((m) => parseMarket(m, event.title, isMultiOption))
-        .filter(Boolean);
-
-      // For multi-option events, cap the number of options we keep, taking the
-      // highest-volume ones so a single large event can't dominate the feed.
-      if (isMultiOption && parsed.length > MAX_SUBMARKETS_PER_EVENT) {
-        parsed = parsed
-          .sort((a, b) => b.volume - a.volume)
-          .slice(0, MAX_SUBMARKETS_PER_EVENT);
+      let reachedMax = false;
+      for (const event of page) {
+        if (collectMarketsFromEvent(event, markets, seenTitles)) {
+          reachedMax = true;
+          break;
+        }
       }
 
-      for (const market of parsed) {
-        if (markets.length >= MAX_MARKETS) break;
+      // Drop the raw page's fat event objects before the next fetch so peak
+      // memory stays flat regardless of MAX_EVENTS.
+      page = null;
 
-        const titleKey = `${market.question}-${market.prediction}`;
-        if (seenTitles.has(titleKey)) continue;
-        seenTitles.add(titleKey);
-
-        markets.push(market);
-      }
+      if (reachedMax || noMorePages) break;
     }
 
     return markets;
@@ -291,31 +340,41 @@ async function scrapePolymarketMarkets() {
   }
 }
 
-// Function to process markets with GPT formatting
-async function processMarketsWithGPT(markets) {
+// Max number of concurrent Claude requests in flight at once. Bounds peak memory
+// (each in-flight request holds a TLS socket + buffers) and eases Anthropic rate limits.
+const CLAUDE_CONCURRENCY = 20;
+
+// Function to process markets with Claude formatting
+async function processMarketsWithClaude(markets) {
   // Limit to MAX_MARKETS
   const marketsToProcess = markets.slice(0, MAX_MARKETS);
-  console.log(`Processing ${marketsToProcess.length} markets with GPT...`);
+  console.log(`Processing ${marketsToProcess.length} markets with Claude...`);
 
-  // Process all titles in parallel with Promise.all
-  const processedMarkets = await Promise.all(
-    marketsToProcess.map(async (market) => {
-      const formattedTitle = await formatTitleWithGPT(
-        market.question,
-        market.prediction
-      );
-      return {
-        title: formattedTitle,
-        question: market.question,
-        prediction: market.prediction,
-        probability: market.probability,
-        volume: market.volume
-      };
-    })
-  );
+  // Process in bounded batches instead of firing all requests at once, so peak
+  // memory stays flat regardless of MAX_MARKETS.
+  const processedMarkets = [];
+  for (let i = 0; i < marketsToProcess.length; i += CLAUDE_CONCURRENCY) {
+    const batch = marketsToProcess.slice(i, i + CLAUDE_CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map(async (market) => {
+        const formattedTitle = await formatTitleWithClaude(
+          market.question,
+          market.prediction
+        );
+        return {
+          title: formattedTitle,
+          question: market.question,
+          prediction: market.prediction,
+          probability: market.probability,
+          volume: market.volume
+        };
+      })
+    );
+    processedMarkets.push(...batchResults);
+  }
 
   console.log(
-    `Finished processing ${processedMarkets.length} markets with GPT`
+    `Finished processing ${processedMarkets.length} markets with Claude`
   );
   return processedMarkets;
 }
@@ -332,7 +391,7 @@ async function getCachedMarkets() {
       "No cache found. Fetching and processing markets for the first time..."
     );
     const markets = await scrapePolymarketMarkets();
-    cachedMarkets = await processMarketsWithGPT(markets);
+    cachedMarkets = await processMarketsWithClaude(markets);
     cacheTimestamp = now;
     console.log("Initial cache populated successfully");
 
@@ -362,7 +421,7 @@ async function refreshCacheInBackground() {
   try {
     console.log("Starting background cache refresh...");
     const freshMarkets = await scrapePolymarketMarkets();
-    const processedMarkets = await processMarketsWithGPT(freshMarkets);
+    const processedMarkets = await processMarketsWithClaude(freshMarkets);
     cachedMarkets = processedMarkets;
     cacheTimestamp = Date.now();
     console.log("Background cache refresh completed successfully");
